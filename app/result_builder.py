@@ -1,110 +1,162 @@
 # -*- coding: utf-8 -*-
 """
-结果构造
+结果构造器
 
-将 Nuclei finding (JSON) 构造为 Akto TestingRunResult 文档。
+将 Nuclei JSON 输出转换为 Akto TestingRunResult 文档。
+完全重写（不复用 ZAP-Bridge），适配 Nuclei v3 字段名:
+  - matched-at (非 matched_at)
+  - template-id (非 templateID)
+  - info.severity
+  - info.description
 """
-import time
 import logging
-from typing import Dict, List
-
-from . import config
+from typing import List, Dict
+from bson import ObjectId
 
 logger = logging.getLogger("nuclei-bridge")
 
+# Akto severity 映射
+_SEVERITY_MAP = {
+    "critical": "HIGH",
+    "high": "HIGH",
+    "medium": "MEDIUM",
+    "low": "LOW",
+    "info": "LOW",
+    "unknown": "LOW",
+}
 
-def map_nuclei_to_akto_sub_type(template_path: str) -> str:
-    """
-    将 Nuclei 模板路径映射到 Akto TestCategory。
-    """
-    for prefix, akto_type in config.NUCLEI_TEMPLATE_TO_AKTO.items():
-        if prefix in (template_path or ""):
-            return akto_type
-    return config.DEFAULT_AKTO_SUB_TYPE
+# 默认置信度/百分比（Nuclei 无此概念，固定值）
+_DEFAULT_PERCENTAGE = 100
 
 
-def map_severity(nuclei_severity: str) -> str:
+def _map_severity(nuclei_severity: str) -> str:
     """Nuclei severity → Akto severity"""
-    return config.NUCLEI_SEVERITY_MAP.get(
-        (nuclei_severity or "info").lower(), "LOW"
-    )
+    if not nuclei_severity:
+        return "LOW"
+    return _SEVERITY_MAP.get(nuclei_severity.lower(), "LOW")
 
 
-def build_result_from_finding(
-    finding: dict,
-    api_info_key: dict,
-    test_run_id,
+def _get_matched_url(finding: Dict) -> str:
+    """兼容获取 matched URL（Nuclei v3 用 matched-at，旧版用 matched_at）"""
+    return finding.get("matched-at") or finding.get("matched_at") or ""
+
+
+def _get_template_id(finding: Dict) -> str:
+    """兼容获取 template id"""
+    return finding.get("template-id") or finding.get("templateID") or ""
+
+
+def build_result(
+    finding: Dict,
+    task_id,
     summary_id,
-    start_time: int,
-) -> dict:
+    api_collection_id: int,
+    api_key: dict,
+    url_to_api_key: Dict[str, dict],
+) -> Dict:
     """
-    将单个 Nuclei finding 构造为 Akto TestingRunResult 文档。
+    将单个 Nuclei finding 转换为 Akto TestingRunResult 文档。
 
-    对齐 ZAP-Bridge V10.0 的 BSON 数据契约:
-      - 集合名: TestingRunResult (大驼峰)
-      - _class: com.akto.dto.testing.TestResult
-      - apiInfoKey 外层必需
-      - vulnerable / confidence 父类字段
+    Args:
+        finding: Nuclei JSON 输出
+        task_id: TestingRun._id
+        summary_id: TestingRunResultSummary._id
+        api_collection_id: 目标 Collection ID
+        api_key: ApiInfo._id 子文档 {apiCollectionId, method, url}
+        url_to_api_key: {url: api_key} 映射，用于精确匹配
     """
-    template_path = finding.get("template-path", finding.get("template-url", ""))
-    template_id = finding.get("template-id", finding.get("templateID", ""))
-    akto_sub_type = map_nuclei_to_akto_sub_type(template_path)
-    severity = map_severity(finding.get("severity", "info"))
+    matched_url = _get_matched_url(finding)
+    template_id = _get_template_id(finding)
+    info = finding.get("info", {}) or {}
+    severity = _map_severity(info.get("severity", "unknown"))
+    description = info.get("description", "") or template_id
+
+    # 精确匹配 api_key（优先精确，其次后缀匹配）
+    matched_api_key = _match_api_key(matched_url, url_to_api_key, api_key)
 
     return {
-        "testRunId": test_run_id,
+        "_id": ObjectId(),
+        "_class": "com.akto.dto.testing.TestResult",
+        "apiInfoKey": {
+            "apiCollectionId": int(api_collection_id),
+            "method": matched_api_key.get("method", "GET"),
+            "url": matched_api_key.get("url", matched_url),
+            "version": 0,
+        },
+        "testRunId": task_id,
         "testRunResultSummaryId": summary_id,
-
-        # 外层必需字段
-        "apiInfoKey": api_info_key,
-        "testSuperType": "DAST",
-        "testSubType": akto_sub_type,
-
-        # 时间戳
-        "startTimestamp": start_time,
-        "endTimestamp": int(time.time()),
-
-        # 父类字段 (GenericTestResult)
-        "vulnerable": True,
-        "confidence": "HIGH",
-        "confidencePercentage": 100,
-
-        # 测试结果数组
-        "testResults": [{
-            "_class": config.AKTO_TEST_RESULT_CLASS,
-            "message": finding.get("description", "") or template_id,
-            "originalMessage": finding.get("matched-at", finding.get("matched_at", "")),
-            "errors": [],
-            "percentageMatch": 100,
-        }],
-
-        # 漏洞元数据
+        "originalApiInfoId": {
+            "apiCollectionId": int(api_collection_id),
+            "method": matched_api_key.get("method", "GET"),
+            "url": matched_api_key.get("url", matched_url),
+            "version": 0,
+        },
+        "message": description,
         "severity": severity,
-        "originalMessage": finding.get("matched-at", ""),
+        "confidence": severity,
+        "title": template_id,
+        "description": description,
+        "matchedUrl": matched_url,
+        "matchedUrlType": "URL",
+        "matchedUrlMethod": matched_api_key.get("method", "GET"),
+        "vulnerable": True,
+        "percentageMatch": _DEFAULT_PERCENTAGE,
+        "confidencePercentage": _DEFAULT_PERCENTAGE,
+        "source": "NUCLEI",
+        "metadata": {
+            "template-id": template_id,
+            "type": finding.get("type", ""),
+            "host": finding.get("host", ""),
+            "ip": finding.get("ip", ""),
+            "curl-command": finding.get("curl-command", ""),
+        },
     }
 
 
-def count_by_severity(results: List[dict]) -> dict:
-    """统计各严重级别的漏洞数量"""
+def _match_api_key(matched_url: str, url_to_api_key: Dict[str, dict],
+                   default_api_key: dict) -> dict:
+    """
+    精确匹配 matched_url 对应的 api_key。
+    精确失败时尝试后缀匹配（防 path 末尾斜杠差异）。
+    """
+    if not matched_url:
+        return default_api_key
+    # 精确匹配
+    if matched_url in url_to_api_key:
+        return url_to_api_key[matched_url]
+    # 后缀匹配（去掉末尾斜杠后重试）
+    normalized = matched_url.rstrip("/")
+    for url, key in url_to_api_key.items():
+        if url.rstrip("/") == normalized:
+            return key
+    return default_api_key
+
+
+def count_by_severity(findings: List[Dict]) -> Dict[str, int]:
+    """统计各 severity 数量"""
     counts = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
-    for r in results:
-        sev = r.get("severity", "LOW")
-        if sev in counts:
-            counts[sev] += 1
-        else:
-            counts["LOW"] += 1
+    for f in findings:
+        info = f.get("info", {}) or {}
+        sev = _map_severity(info.get("severity", "unknown"))
+        counts[sev] = counts.get(sev, 0) + 1
     return counts
 
 
-def deduplicate_findings(findings: List[dict]) -> List[dict]:
+def deduplicate_findings(findings: List[Dict]) -> List[Dict]:
     """
-    扫描结果去重。
-    同一 url + template-id 只保留一条。
+    扫描结果去重。同一 url + template-id 只保留一条。
+    空 matched-at 时用 host + template-id 防误删。
     """
     seen = set()
     unique = []
     for f in findings:
-        key = f"{f.get('matched-at', '')}:{f.get('template-id', '')}"
+        matched = _get_matched_url(f)
+        tpl = _get_template_id(f)
+        host = f.get("host", f.get("ip", ""))
+        if matched:
+            key = f"{matched}:{tpl}"
+        else:
+            key = f"__no_url__:{host}:{tpl}"
         if key not in seen:
             seen.add(key)
             unique.append(f)
