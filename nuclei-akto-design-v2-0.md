@@ -167,19 +167,29 @@ class NucleiClient:
         cmd.extend(self._auth_headers)
 
         try:
-            result = subprocess.run(
+            # P2-2修复: 用 Popen 替代 run，设置 _current_process 支持优雅关闭
+            self._current_process = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=self.scan_timeout,  # P1-6修复: 总超时
             )
-        except subprocess.TimeoutExpired:
-            logger.warning("Nuclei 扫描超时 | url=%s timeout=%ds", url, self.scan_timeout)
+            try:
+                stdout, _ = self._current_process.communicate(timeout=self.scan_timeout)
+            except subprocess.TimeoutExpired:
+                self._current_process.kill()
+                self._current_process.wait()
+                logger.warning("Nuclei 扫描超时 | url=%s timeout=%ds", url, self.scan_timeout)
+                return []
+            finally:
+                self._current_process = None
+        except Exception as e:
+            logger.error("Nuclei 扫描启动失败 | url=%s error=%s", url, e)
             return []
 
         # P2-7修复: 解析 JSON 输出，跳过非 JSON 行
         alerts = []
-        for line in result.stdout.strip().split('\n'):
+        for line in stdout.strip().split('\n'):
             if not line or not line.startswith('{'):
                 continue
             try:
@@ -214,7 +224,7 @@ class NucleiClient:
         try:
             cmd = [
                 self.nuclei_path,
-                "-u", url_list_path,    # 批量 URL 列表
+                "-l", url_list_path,      # P2-1修复: -l (list) 而非 -u (single url)
                 "-json",
                 "-severity", severity,
                 "-nc",
@@ -232,17 +242,27 @@ class NucleiClient:
 
             logger.info("Nuclei 批量扫描 | urls=%d templates=%s", len(urls), templates)
 
-            result = subprocess.run(
+            # P2-2修复: 用 Popen 替代 run，设置 _current_process 支持优雅关闭
+            self._current_process = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=self.scan_timeout,
             )
+            try:
+                stdout, _ = self._current_process.communicate(timeout=self.scan_timeout)
+            except subprocess.TimeoutExpired:
+                self._current_process.kill()
+                self._current_process.wait()
+                logger.warning("Nuclei 批量扫描超时 | urls=%d timeout=%ds", len(urls), self.scan_timeout)
+                return {}
+            finally:
+                self._current_process = None
 
             # P2-18修复: 扫描结果去重
             seen: Set[str] = set()
             results: Dict[str, List[Dict]] = {}
-            for line in result.stdout.strip().split('\n'):
+            for line in stdout.strip().split('\n'):
                 if not line or not line.startswith('{'):
                     continue
                 try:
@@ -265,8 +285,8 @@ class NucleiClient:
 
             return results
 
-        except subprocess.TimeoutExpired:
-            logger.warning("Nuclei 批量扫描超时 | urls=%d timeout=%ds", len(urls), self.scan_timeout)
+        except Exception as e:
+            logger.error("Nuclei 批量扫描异常: %s", e)
             return {}
         finally:
             os.unlink(url_list_path)
@@ -353,12 +373,9 @@ NUCLEI_SEVERITY_MAP = {
 }
 
 # 默认扫描模板
-DEFAULT_TEMPLATES = [
-    "cves/",
-    "misconfiguration/",
-    "exposures/",
-    "default-logins/",
-]
+# P3-3修复: 支持环境变量覆盖，逗号分隔字符串 → 列表
+_DEFAULT_TEMPLATES_STR = os.getenv("DEFAULT_TEMPLATES", "cves/,misconfiguration/,exposures/,default-logins/")
+DEFAULT_TEMPLATES = [t.strip() for t in _DEFAULT_TEMPLATES_STR.split(",") if t.strip()]
 
 # 默认 Akto 分类（未匹配时的兜底）
 DEFAULT_AKTO_SUB_TYPE = "SM"
@@ -599,19 +616,21 @@ class NucleiBridgeService:
     def _run_task_cycle(self):
         """单个任务周期"""
         # P1-13修复: 用 NUCLEI_TARGET_COLLECTION_ID 过滤
-        task = self._mongo.claim_task(config.NUCLEI_TARGET_COLLECTION_ID)
+        # P3-2修复: int() 转换（环境变量是字符串）
+        collection_id = int(config.NUCLEI_TARGET_COLLECTION_ID)
+        task = self._mongo.claim_task(collection_id)
         if not task:
             return
 
         task_id = task["_id"]
         start_time = int(time.time())
-        logger.info("抢占任务 | task_id=%s collection_id=%s", task_id, config.NUCLEI_TARGET_COLLECTION_ID)
+        logger.info("抢占任务 | task_id=%s collection_id=%s", task_id, collection_id)
 
         # 初始化 Summary
         summary_id = self._mongo.create_summary(task_id, start_time)
 
         # 查询 API 端点列表
-        api_endpoints = self._mongo.get_api_endpoints(config.NUCLEI_TARGET_COLLECTION_ID)
+        api_endpoints = self._mongo.get_api_endpoints(collection_id)
         if not api_endpoints:
             logger.warning("无 API 端点 | collection_id=%s", config.NUCLEI_TARGET_COLLECTION_ID)
             self._mongo.complete_task(task_id, int(time.time()), 0)
@@ -683,6 +702,12 @@ class NucleiBridgeService:
         count_issues = count_by_severity(results_to_insert)
         self._mongo.complete_summary(summary_id, end_time, count_issues)
         self._mongo.complete_task(task_id, end_time, end_time - start_time)
+
+    # count_by_severity 函数定义（P3-1修复: 补充实现）
+    # def count_by_severity(results: list) -> dict:
+    #     """统计各严重级别的漏洞数量"""
+    #     from collections import Counter
+    #     return dict(Counter(r.get("testResults", [{}])[0].get("severity", "LOW") for r in results))
         logger.info("任务完成 | task_id=%s findings=%d duration=%ds", task_id, len(results_to_insert), end_time - start_time)
 
     def _signal_handler(self, signum, frame):
